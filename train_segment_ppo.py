@@ -31,11 +31,16 @@ from lending_rl_agent.torch_segment_simulator import (
 SAMPLE_MODE = "reservoir"
 SOFT_RESERVE = True
 TERMINAL_RUNOFF_DISCOUNT = 0.99
-TERMINAL_VALUE_WEIGHT = 1.0
+TERMINAL_VALUE_WEIGHT = 0.0
 TRAIN_CALIBRATION_AUGMENTATION = "stress"
 MIN_CAPITAL_RATIO = 0.08
 LIQUIDITY_LIQUIDATION_HAIRCUT = 0.60
 SIMULATOR_BACKEND = "torch"
+ALLOCATION_TEMPERATURE = 1.0
+SEGMENT_EPR_PRIOR_SCALE = 0.0
+EXPECTED_PROFIT_SHAPING_WEIGHT = 0.0
+ALLOCATION_TOP_K = 0
+MIN_EXPECTED_PROFIT_RATE = -1.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,12 +67,22 @@ def parse_args() -> argparse.Namespace:
         default=0.05,
         help="Additional liquidity reserve required per dollar of outstanding exposure.",
     )
-    parser.add_argument("--liquidity-penalty-lambda", type=float, default=10.0)
+    parser.add_argument("--liquidity-penalty-lambda", type=float, default=1.0)
     parser.add_argument("--terminal-runoff-months", type=int, default=60)
+    parser.add_argument(
+        "--expected-inflation-annual",
+        type=float,
+        default=0.025,
+        help="Annual expected inflation drag on idle cash, applied monthly in real-value terms.",
+    )
     parser.add_argument("--recovery-rate", type=float, default=0.10)
     parser.add_argument("--funding-cost-annual", type=float, default=0.03)
     parser.add_argument("--servicing-cost-rate", type=float, default=0.005)
     parser.add_argument("--hidden-size", type=int, default=256)
+    parser.add_argument("--policy-architecture", choices=["attention", "mlp"], default="attention")
+    parser.add_argument("--attention-heads", type=int, default=4)
+    parser.add_argument("--attention-layers", type=int, default=2)
+    parser.add_argument("--attention-dropout", type=float, default=0.0)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--ppo-epochs", type=int, default=6)
     parser.add_argument("--minibatch-size", type=int, default=1024)
@@ -80,8 +95,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gpu-default-mode",
         choices=["normal", "expected"],
-        default="normal",
-        help="GPU simulator default model. normal uses MPS-friendly normal approximation; expected is deterministic.",
+        default="expected",
+        help="GPU simulator default model. expected is deterministic and matches segment expected-profit calibration.",
+    )
+    parser.add_argument(
+        "--min-expected-profit-rate",
+        type=float,
+        default=MIN_EXPECTED_PROFIT_RATE,
+        help="PPO-only default keeps every segment eligible; raise this to hard-mask low-EPR segments.",
+    )
+    parser.add_argument(
+        "--negative-epr-penalty",
+        type=float,
+        default=0.0,
+        help="Reward penalty for actor probability mass assigned to masked unprofitable segments.",
     )
     parser.add_argument("--cache-dir", default="outputs/cache")
     parser.add_argument("--refresh-cache", action="store_true")
@@ -97,6 +124,10 @@ def parse_args() -> argparse.Namespace:
     args.min_capital_ratio = MIN_CAPITAL_RATIO
     args.liquidity_liquidation_haircut = LIQUIDITY_LIQUIDATION_HAIRCUT
     args.simulator_backend = SIMULATOR_BACKEND
+    args.allocation_temperature = ALLOCATION_TEMPERATURE
+    args.segment_epr_prior_scale = SEGMENT_EPR_PRIOR_SCALE
+    args.expected_profit_shaping_weight = EXPECTED_PROFIT_SHAPING_WEIGHT
+    args.allocation_top_k = ALLOCATION_TOP_K
     return args
 
 
@@ -141,6 +172,13 @@ def main() -> None:
         entropy_coef=args.entropy_coef,
         seed=args.seed,
         device=args.device,
+        architecture=args.policy_architecture,
+        segment_count=calibrations["train"].segment_count,
+        maturity_bucket_count=calibrations["train"].maturity_bucket_count,
+        segment_parameter_count=4,
+        attention_heads=args.attention_heads,
+        attention_layers=args.attention_layers,
+        attention_dropout=args.attention_dropout,
     )
 
     def train_env_factory(local_seed: int) -> SegmentLendingEnv:
@@ -192,6 +230,8 @@ def main() -> None:
             "maturity_bucket_count": calibrations["train"].maturity_bucket_count,
             "methodology": "segment_level_continuous_capital_allocation",
             "liquidate_on_breach_training": True,
+            "policy_architecture": args.policy_architecture,
+            "min_expected_profit_rate": args.min_expected_profit_rate,
         },
     )
 
@@ -217,6 +257,7 @@ def main() -> None:
             "maturity_bucket_count": calibrations["train"].maturity_bucket_count,
             "segment_parameter_count": 4,
             "segment_parameter_names": list(train_env._reset_info()["segment_parameter_names"]),
+            "policy_architecture": args.policy_architecture,
         },
         "action": {
             "form": "actor_raw -> deployment_fraction_and_segment_weights -> feasible_allocation",
@@ -238,7 +279,13 @@ def main() -> None:
         "training_rule": {
             "liquidate_on_breach": True,
             "liquidity_liquidation_haircut": LIQUIDITY_LIQUIDATION_HAIRCUT,
+            "expected_inflation_annual": args.expected_inflation_annual,
+            "allocation_temperature": ALLOCATION_TEMPERATURE,
+            "segment_epr_prior_scale": SEGMENT_EPR_PRIOR_SCALE,
+            "expected_profit_shaping_weight": EXPECTED_PROFIT_SHAPING_WEIGHT,
+            "allocation_top_k": ALLOCATION_TOP_K,
             "description": "Training and evaluation both terminate an episode on capital-adequacy or liquidity breach. Liquidity liquidation subtracts a 60% haircut on current assets.",
+            "terminal_value_weight": TERMINAL_VALUE_WEIGHT,
         },
         "validation": validation_results,
         "test": test_results,
@@ -357,6 +404,12 @@ def build_env(
         liquidate_on_breach=liquidate_on_breach,
         min_capital_ratio=MIN_CAPITAL_RATIO,
         liquidity_liquidation_haircut=LIQUIDITY_LIQUIDATION_HAIRCUT,
+        expected_inflation_annual=args.expected_inflation_annual,
+        allocation_temperature=args.allocation_temperature,
+        segment_epr_prior_scale=args.segment_epr_prior_scale,
+        expected_profit_shaping_weight=args.expected_profit_shaping_weight,
+        allocation_top_k=args.allocation_top_k,
+        min_expected_profit_rate=args.min_expected_profit_rate,
     )
 
 
@@ -493,6 +546,9 @@ def compact_policy_summary(summary: dict) -> dict:
     keys = [
         "episode_count",
         "cumulative_profit_mean",
+        "decision_period_profit_mean",
+        "terminal_runoff_profit_mean",
+        "terminal_value_mean",
         "liquidity_breach_mean",
         "liquidated_episode_count",
         "liquidity_liquidation_episode_count",
@@ -501,6 +557,9 @@ def compact_policy_summary(summary: dict) -> dict:
         "min_capital_adequacy_ratio_mean",
         "expected_shortfall_mean",
         "liquidation_loss_mean",
+        "cash_inflation_cost_mean",
+        "expected_deployment_profit_mean",
+        "expected_profit_shaping_reward_mean",
     ]
     return {key: summary.get(key) for key in keys if key in summary}
 
